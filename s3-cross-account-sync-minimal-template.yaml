@@ -1,0 +1,492 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'S3 Cross-Partition Sync Solution - Multi-Region Support'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Required Configuration"
+        Parameters:
+          - SourceRegion
+          - SourceBucketName
+          - TargetRegion
+          - TargetBucketName
+          - TargetAccessKeyId
+          - TargetSecretAccessKey
+      - Label:
+          default: "Optional Settings"
+        Parameters:
+          - SecretsManagerSecretName
+          - TmpDirectorySize
+    ParameterLabels:
+      SourceRegion:
+        default: "Source Region (AWS China)"
+      SourceBucketName:
+        default: "Source S3 Bucket Name"
+      TargetRegion:
+        default: "Target Region (AWS Global)"
+      TargetBucketName:
+        default: "Target S3 Bucket Name"
+      TargetAccessKeyId:
+        default: "Target Account Access Key ID"
+      TargetSecretAccessKey:
+        default: "Target Account Secret Access Key"
+      SecretsManagerSecretName:
+        default: "Secrets Manager Secret Name"
+      TmpDirectorySize:
+        default: "Lambda /tmp Directory Size (MB)"
+
+Parameters:
+  SourceRegion:
+    Type: String
+    Default: 'cn-northwest-1'
+    Description: 'Source region in AWS China'
+    AllowedValues: 
+      - 'cn-northwest-1'
+      - 'cn-north-1'
+
+  SourceBucketName:
+    Type: String
+    Description: 'Source S3 bucket name (in AWS China region)'
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+
+  TargetRegion:
+    Type: String
+    Default: 'us-west-2'
+    Description: 'Target region (AWS Global)'
+    AllowedValues: 
+      # US Regions
+      - 'us-east-1'
+      - 'us-east-2'
+      - 'us-west-1'
+      - 'us-west-2'
+      # Europe Regions
+      - 'eu-west-1'
+      - 'eu-west-2'
+      - 'eu-west-3'
+      - 'eu-central-1'
+      - 'eu-north-1'
+      - 'eu-south-1'
+      # Asia Pacific Regions
+      - 'ap-southeast-1'
+      - 'ap-southeast-2'
+      - 'ap-northeast-1'
+      - 'ap-northeast-2'
+      - 'ap-northeast-3'
+      - 'ap-south-1'
+      - 'ap-east-1'
+      # Other Regions
+      - 'ca-central-1'
+      - 'sa-east-1'
+      - 'af-south-1'
+      - 'me-south-1'
+
+  TargetBucketName:
+    Type: String
+    Description: 'Target S3 bucket name (in AWS Global region)'
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+
+  TargetAccessKeyId:
+    Type: String
+    Description: 'AWS Access Key ID for target account'
+    MinLength: 16
+    MaxLength: 128
+    NoEcho: true
+
+  TargetSecretAccessKey:
+    Type: String
+    Description: 'AWS Secret Access Key for target account'
+    MinLength: 1
+    NoEcho: true
+
+  SecretsManagerSecretName:
+    Type: String
+    Default: 's3-cross-partition-sync-credentials'
+    Description: 'Name for the Secrets Manager secret'
+    MinLength: 1
+    MaxLength: 512
+
+  TmpDirectorySize:
+    Type: Number
+    Default: 2048
+    MinValue: 512
+    MaxValue: 10240
+    Description: 'Lambda /tmp directory size in MB (512MB - 10GB)'
+    ConstraintDescription: 'Must be between 512 and 10240 MB'
+
+Resources:
+  # Secrets Manager Secret
+  TargetAccountCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref SecretsManagerSecretName
+      Description: 'Cross-partition S3 sync target account credentials'
+      SecretString: !Sub |
+        {
+          "AccessKeyId": "${TargetAccessKeyId}",
+          "SecretAccessKey": "${TargetSecretAccessKey}"
+        }
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:aws-cn:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: S3CrossPartitionSyncPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:HeadObject', 's3:ListBucket']
+                Resource: 
+                  - !Sub 'arn:aws-cn:s3:::${SourceBucketName}'
+                  - !Sub 'arn:aws-cn:s3:::${SourceBucketName}/*'
+              - Effect: Allow
+                Action: 'secretsmanager:GetSecretValue'
+                Resource: !Ref TargetAccountCredentials
+
+  # Lambda function
+  SyncLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'S3CrossPartitionSync'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      EphemeralStorage:
+        Size: !Ref TmpDirectorySize
+      Environment:
+        Variables:
+          SOURCE_REGION: !Ref SourceRegion
+          TARGET_REGION: !Ref TargetRegion
+          SOURCE_BUCKET: !Ref SourceBucketName
+          TARGET_BUCKET: !Ref TargetBucketName
+          SECRETS_MANAGER_SECRET_NAME: !Ref SecretsManagerSecretName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from botocore.exceptions import ClientError
+          import os
+          import urllib.parse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          class CrossPartitionS3Sync:
+              def __init__(self):
+                  self.source_region = os.environ['SOURCE_REGION']
+                  self.target_region = os.environ['TARGET_REGION']
+                  self.source_bucket = os.environ['SOURCE_BUCKET']
+                  self.target_bucket = os.environ['TARGET_BUCKET']
+                  self.secrets_name = os.environ['SECRETS_MANAGER_SECRET_NAME']
+                  
+                  # Initialize clients
+                  self.source_s3 = boto3.client('s3', region_name=self.source_region)
+                  self.secrets_client = boto3.client('secretsmanager', region_name=self.source_region)
+                  
+                  # Get target credentials and initialize target S3 client
+                  credentials = self._get_target_credentials()
+                  self.target_s3 = boto3.client(
+                      's3',
+                      region_name=self.target_region,
+                      aws_access_key_id=credentials['AccessKeyId'],
+                      aws_secret_access_key=credentials['SecretAccessKey']
+                  )
+
+              def _get_target_credentials(self):
+                  """Get target credentials from Secrets Manager"""
+                  try:
+                      response = self.secrets_client.get_secret_value(SecretId=self.secrets_name)
+                      return json.loads(response['SecretString'])
+                  except Exception as e:
+                      logger.error(f"Failed to get credentials: {e}")
+                      raise
+
+              def get_object_metadata(self, s3_client, bucket, key):
+                  """Get S3 object metadata"""
+                  try:
+                      response = s3_client.head_object(Bucket=bucket, Key=key)
+                      return {
+                          'etag': response.get('ETag', '').strip('"'),
+                          'size': response.get('ContentLength', 0),
+                          'content_type': response.get('ContentType')
+                      }
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == '404':
+                          return None
+                      raise
+
+              def should_sync(self, source_meta, target_meta):
+                  """Check if object needs syncing"""
+                  if not target_meta:
+                      return True
+                  return (source_meta['etag'] != target_meta['etag'] or 
+                          source_meta['size'] != target_meta['size'])
+
+              def copy_object(self, key):
+                  """Copy object from source to target"""
+                  try:
+                      # Check if sync needed
+                      source_meta = self.get_object_metadata(self.source_s3, self.source_bucket, key)
+                      if not source_meta:
+                          return False
+                      
+                      target_meta = self.get_object_metadata(self.target_s3, self.target_bucket, key)
+                      if not self.should_sync(source_meta, target_meta):
+                          logger.info(f"Object {key} already in sync")
+                          return True
+                      
+                      file_size = source_meta['size']
+                      logger.info(f"Copying {key}, size: {file_size} bytes from {self.source_region} to {self.target_region}")
+                      
+                      # Handle small vs large files differently
+                      if file_size < 100 * 1024 * 1024:  # < 100MB - use memory
+                          return self._copy_small_file(key, source_meta)
+                      else:  # >= 100MB - use /tmp directory
+                          return self._copy_large_file(key, source_meta)
+                      
+                  except Exception as e:
+                      logger.error(f"Failed to copy {key}: {e}")
+                      return False
+
+              def _copy_small_file(self, key, source_meta):
+                  """Copy small file using memory"""
+                  source_obj = self.source_s3.get_object(Bucket=self.source_bucket, Key=key)
+                  body_content = source_obj['Body'].read()
+                  
+                  put_args = {'Bucket': self.target_bucket, 'Key': key, 'Body': body_content}
+                  if source_meta['content_type']:
+                      put_args['ContentType'] = source_meta['content_type']
+                  
+                  self.target_s3.put_object(**put_args)
+                  logger.info(f"Successfully copied small file {key}")
+                  return True
+
+              def _copy_large_file(self, key, source_meta):
+                  """Copy large file using /tmp directory"""
+                  import os
+                  
+                  temp_file_path = f"/tmp/{os.path.basename(key)}"
+                  
+                  try:
+                      # Download to /tmp
+                      logger.info(f"Downloading large file {key} to /tmp")
+                      self.source_s3.download_file(self.source_bucket, key, temp_file_path)
+                      
+                      # Upload from /tmp
+                      logger.info(f"Uploading large file {key} from /tmp")
+                      extra_args = {}
+                      if source_meta['content_type']:
+                          extra_args['ContentType'] = source_meta['content_type']
+                      
+                      self.target_s3.upload_file(temp_file_path, self.target_bucket, key, ExtraArgs=extra_args)
+                      
+                      logger.info(f"Successfully copied large file {key}")
+                      return True
+                      
+                  finally:
+                      # Clean up temp file
+                      if os.path.exists(temp_file_path):
+                          os.remove(temp_file_path)
+                          logger.info(f"Cleaned up temp file: {temp_file_path}")
+
+              def process_event(self, records):
+                  """Process S3 event records"""
+                  results = {'success': [], 'failed': []}
+                  
+                  for record in records:
+                      try:
+                          if record.get('eventSource') == 'aws:s3':
+                              key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                              if self.copy_object(key):
+                                  results['success'].append(key)
+                              else:
+                                  results['failed'].append(key)
+                      except Exception as e:
+                          logger.error(f"Error processing record: {e}")
+                          results['failed'].append(str(record))
+                  
+                  return results
+
+          def lambda_handler(event, context):
+              try:
+                  sync = CrossPartitionS3Sync()
+                  
+                  # Handle different event types
+                  if 'Records' in event:
+                      results = sync.process_event(event['Records'])
+                  elif 'detail' in event and 'object' in event['detail']:
+                      # EventBridge format
+                      record = {
+                          'eventSource': 'aws:s3',
+                          's3': {
+                              'object': {'key': event['detail']['object']['key']}
+                          }
+                      }
+                      results = sync.process_event([record])
+                  elif 'test_key' in event:
+                      # Manual test
+                      success = sync.copy_object(event['test_key'])
+                      results = {
+                          'success': [event['test_key']] if success else [],
+                          'failed': [] if success else [event['test_key']]
+                      }
+                  else:
+                      raise ValueError("Unsupported event format")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'message': 'Cross-partition S3 sync completed',
+                          'results': results
+                      }
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Lambda execution failed: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': {'error': str(e)}
+                  }
+
+  # EventBridge rule
+  S3EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Trigger sync on S3 object creation'
+      EventPattern:
+        source: ['aws.s3']
+        detail-type: ['Object Created']
+        detail:
+          bucket:
+            name: [!Ref SourceBucketName]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SyncLambdaFunction.Arn
+          Id: S3SyncTarget
+
+  # Lambda permission for EventBridge
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SyncLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3EventRule.Arn
+
+  # S3 EventBridge configuration
+  S3NotificationConfiguration:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ConfigureS3NotificationFunction.Arn
+      SourceBucket: !Ref SourceBucketName
+
+  # S3 notification setup function
+  ConfigureS3NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ConfigureS3NotificationRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+
+          def lambda_handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  bucket = event['ResourceProperties']['SourceBucket']
+                  
+                  if event['RequestType'] in ['Create', 'Update']:
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={'EventBridgeConfiguration': {}}
+                      )
+                  elif event['RequestType'] == 'Delete':
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={}
+                      )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  logging.error(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # Role for S3 notification setup
+  ConfigureS3NotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:aws-cn:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: S3NotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:PutBucketNotification', 's3:GetBucketNotification']
+                Resource: !Sub 'arn:aws-cn:s3:::${SourceBucketName}'
+
+Outputs:
+  LambdaFunctionName:
+    Description: 'Sync Lambda Function Name'
+    Value: !Ref SyncLambdaFunction
+
+  SecretsManagerSecretName:
+    Description: 'Secrets Manager Secret Name'
+    Value: !Ref SecretsManagerSecretName
+
+  SetupInfo:
+    Description: 'Multi-Region Setup Information'
+    Value: !Sub |
+      ✅ Cross-partition multi-region sync deployed successfully!
+      
+      📍 Source: ${SourceBucketName} (${SourceRegion}) → Target: ${TargetBucketName} (${TargetRegion})
+      🔒 Credentials: Stored in Secrets Manager (${SecretsManagerSecretName})
+      💾 Lambda /tmp directory: ${TmpDirectorySize}MB
+      
+      📊 Supported regions:
+      • Source: cn-northwest-1, cn-north-1 (AWS China)
+      • Target: All major AWS Global regions
+      
+      📋 File processing capabilities:
+      • Small files (< 100MB): Memory processing
+      • Large files (≥ 100MB): /tmp directory processing
+      
+      Next steps for target account:
+      1. Create bucket: aws s3 mb s3://${TargetBucketName} --region ${TargetRegion}
+      2. Ensure target Access Key has S3 permissions for ${TargetBucketName}
+      3. Test: Upload file to ${SourceBucketName}
+
+  TestCommand:
+    Description: 'Test sync function'
+    Value: !Sub |
+      aws lambda invoke --function-name ${SyncLambdaFunction} --payload '{"test_key":"test/sample.txt"}' response.json 
