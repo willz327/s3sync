@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'S3 Cross-Partition Sync Solution - Multi-Region Support'
+Description: 'S3 Cross-Partition Sync Solution - Simplified Single Lambda'
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -13,11 +13,15 @@ Metadata:
           - TargetBucketName
           - TargetAccessKeyId
           - TargetSecretAccessKey
+          - MaxFileSizeCategory
       - Label:
           default: "Optional Settings"
         Parameters:
           - SecretsManagerSecretName
-          - TmpDirectorySize
+          - S3PrefixFilter
+          - RetryAttempts
+          - EnableSNSNotification
+          - NotificationEmail
     ParameterLabels:
       SourceRegion:
         default: "Source Region (AWS China)"
@@ -33,8 +37,16 @@ Metadata:
         default: "Target Account Secret Access Key"
       SecretsManagerSecretName:
         default: "Secrets Manager Secret Name"
-      TmpDirectorySize:
-        default: "Lambda /tmp Directory Size (MB)"
+      MaxFileSizeCategory:
+        default: "Maximum File Size Category"
+      S3PrefixFilter:
+        default: "S3 Prefix Filter (Optional)"
+      RetryAttempts:
+        default: "Retry Attempts"
+      EnableSNSNotification:
+        default: "Enable SNS Email Notification"
+      NotificationEmail:
+        default: "Notification Email Address"
 
 Parameters:
   SourceRegion:
@@ -110,13 +122,65 @@ Parameters:
     MinLength: 1
     MaxLength: 512
 
-  TmpDirectorySize:
+  MaxFileSizeCategory:
+    Type: String
+    Description: 'Maximum expected file size category - determines Lambda memory and /tmp directory allocation. Files larger than 10GB are not supported.'
+    AllowedValues:
+      - 'Under200MB'
+      - '200MB-2GB'
+      - '2GB-10GB'
+    ConstraintDescription: 'Must be Under200MB, 200MB-2GB, or 2GB-10GB. Files larger than 10GB are not supported.'
+
+  S3PrefixFilter:
+    Type: String
+    Default: ''
+    Description: 'Optional S3 prefix filter (e.g., "documents/", "images/2024/"). Leave empty to sync all objects.'
+    MaxLength: 1024
+
+  RetryAttempts:
     Type: Number
-    Default: 2048
-    MinValue: 512
-    MaxValue: 10240
-    Description: 'Lambda /tmp directory size in MB (512MB - 10GB)'
-    ConstraintDescription: 'Must be between 512 and 10240 MB'
+    Default: 3
+    MinValue: 2
+    MaxValue: 10
+    Description: 'Number of retry attempts for failed transfers (2-10)'
+    ConstraintDescription: 'Must be between 2 and 10'
+
+  EnableSNSNotification:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable SNS email notifications for sync failures'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for failure notifications (required if SNS is enabled)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+Mappings:
+  FileSizeConfig:
+    Under200MB:
+      MemorySize: 256
+      TmpDirectorySize: 512
+      ProcessingMode: 'memory'
+      ThresholdMB: 200
+      TimeoutSeconds: 180
+    200MB-2GB:
+      MemorySize: 512
+      TmpDirectorySize: 3072
+      ProcessingMode: 'tmp'
+      ThresholdMB: 2048
+      TimeoutSeconds: 600
+    2GB-10GB:
+      MemorySize: 1024
+      TmpDirectorySize: 10240
+      ProcessingMode: 'tmp'
+      ThresholdMB: 10240
+      TimeoutSeconds: 900
+
+Conditions:
+  CreateSNSNotification: !Equals [!Ref EnableSNSNotification, 'true']
 
 Resources:
   # Secrets Manager Secret
@@ -157,8 +221,28 @@ Resources:
               - Effect: Allow
                 Action: 'secretsmanager:GetSecretValue'
                 Resource: !Ref TargetAccountCredentials
+              - Effect: Allow
+                Action: ['sns:Publish']
+                Resource: !If [CreateSNSNotification, !Ref FailureNotificationTopic, !Ref 'AWS::NoValue']
 
-  # Lambda function
+  # SNS Topic for failure notifications
+  FailureNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSNotification
+    Properties:
+      TopicName: 'S3CrossPartitionSyncFailures'
+      DisplayName: 'S3 Cross-Partition Sync Failure Notifications'
+
+  # SNS Subscription for email notifications
+  FailureNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSNotification
+    Properties:
+      TopicArn: !Ref FailureNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Main Lambda function for S3 sync
   SyncLambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -166,10 +250,10 @@ Resources:
       Runtime: python3.9
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: 900
-      MemorySize: 512
+      Timeout: !FindInMap [FileSizeConfig, !Ref MaxFileSizeCategory, TimeoutSeconds]
+      MemorySize: !FindInMap [FileSizeConfig, !Ref MaxFileSizeCategory, MemorySize]
       EphemeralStorage:
-        Size: !Ref TmpDirectorySize
+        Size: !FindInMap [FileSizeConfig, !Ref MaxFileSizeCategory, TmpDirectorySize]
       Environment:
         Variables:
           SOURCE_REGION: !Ref SourceRegion
@@ -177,6 +261,13 @@ Resources:
           SOURCE_BUCKET: !Ref SourceBucketName
           TARGET_BUCKET: !Ref TargetBucketName
           SECRETS_MANAGER_SECRET_NAME: !Ref SecretsManagerSecretName
+          S3_PREFIX_FILTER: !Ref S3PrefixFilter
+          MAX_FILE_SIZE_CATEGORY: !Ref MaxFileSizeCategory
+          FILE_SIZE_THRESHOLD_MB: !FindInMap [FileSizeConfig, !Ref MaxFileSizeCategory, ThresholdMB]
+          PROCESSING_MODE: !FindInMap [FileSizeConfig, !Ref MaxFileSizeCategory, ProcessingMode]
+          RETRY_ATTEMPTS: !Ref RetryAttempts
+          ENABLE_SNS_NOTIFICATION: !Ref EnableSNSNotification
+          SNS_TOPIC_ARN: !If [CreateSNSNotification, !Ref FailureNotificationTopic, '']
       Code:
         ZipFile: |
           import json
@@ -185,21 +276,32 @@ Resources:
           from botocore.exceptions import ClientError
           import os
           import urllib.parse
+          from datetime import datetime
+          import time
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
           class CrossPartitionS3Sync:
               def __init__(self):
+                  # Environment variables
                   self.source_region = os.environ['SOURCE_REGION']
                   self.target_region = os.environ['TARGET_REGION']
                   self.source_bucket = os.environ['SOURCE_BUCKET']
                   self.target_bucket = os.environ['TARGET_BUCKET']
                   self.secrets_name = os.environ['SECRETS_MANAGER_SECRET_NAME']
+                  self.prefix_filter = os.environ.get('S3_PREFIX_FILTER', '').strip()
+                  self.file_size_threshold_mb = int(os.environ.get('FILE_SIZE_THRESHOLD_MB', '200'))
+                  self.processing_mode = os.environ.get('PROCESSING_MODE', 'memory')
+                  self.retry_attempts = int(os.environ.get('RETRY_ATTEMPTS', '3'))
+                  self.enable_sns = os.environ.get('ENABLE_SNS_NOTIFICATION', 'false').lower() == 'true'
+                  self.sns_topic_arn = os.environ.get('SNS_TOPIC_ARN', '')
                   
                   # Initialize clients
                   self.source_s3 = boto3.client('s3', region_name=self.source_region)
                   self.secrets_client = boto3.client('secretsmanager', region_name=self.source_region)
+                  if self.enable_sns and self.sns_topic_arn:
+                      self.sns_client = boto3.client('sns', region_name=self.source_region)
                   
                   # Get target credentials and initialize target S3 client
                   credentials = self._get_target_credentials()
@@ -233,72 +335,118 @@ Resources:
                           return None
                       raise
 
-              def should_sync(self, source_meta, target_meta):
-                  """Check if object needs syncing"""
-                  if not target_meta:
-                      return True
-                  return (source_meta['etag'] != target_meta['etag'] or 
-                          source_meta['size'] != target_meta['size'])
+              def should_sync_object(self, key):
+                  """Check if object key matches the prefix filter"""
+                  return not self.prefix_filter or key.startswith(self.prefix_filter)
+
+              def send_failure_notification(self, key, error_message, attempts):
+                  """Send SNS notification for sync failure"""
+                  if not self.enable_sns or not self.sns_topic_arn:
+                      return
+                  
+                  try:
+                      subject = f"S3 Cross-Partition Sync Failure: {key}"
+                      message = ("S3 Cross-Partition Sync Failure Report\\n\\n"
+                                f"Object: {key}\\n"
+                                f"Source Bucket: {self.source_bucket} ({self.source_region})\\n"
+                                f"Target Bucket: {self.target_bucket} ({self.target_region})\\n"
+                                f"Attempts Made: {attempts}/{self.retry_attempts}\\n"
+                                f"Error: {error_message}\\n"
+                                f"Timestamp: {datetime.utcnow().isoformat()}Z\\n\\n"
+                                "Please check the CloudWatch logs for more details.")
+                      
+                      self.sns_client.publish(TopicArn=self.sns_topic_arn, Subject=subject, Message=message)
+                      logger.info(f"Failure notification sent for {key}")
+                  except Exception as e:
+                      logger.error(f"Failed to send SNS notification: {e}")
 
               def copy_object(self, key):
-                  """Copy object from source to target"""
-                  try:
-                      # Check if sync needed
-                      source_meta = self.get_object_metadata(self.source_s3, self.source_bucket, key)
-                      if not source_meta:
-                          return False
-                      
-                      target_meta = self.get_object_metadata(self.target_s3, self.target_bucket, key)
-                      if not self.should_sync(source_meta, target_meta):
-                          logger.info(f"Object {key} already in sync")
-                          return True
-                      
-                      file_size = source_meta['size']
-                      logger.info(f"Copying {key}, size: {file_size} bytes from {self.source_region} to {self.target_region}")
-                      
-                      # Handle small vs large files differently
-                      if file_size < 100 * 1024 * 1024:  # < 100MB - use memory
-                          return self._copy_small_file(key, source_meta)
-                      else:  # >= 100MB - use /tmp directory
-                          return self._copy_large_file(key, source_meta)
-                      
-                  except Exception as e:
-                      logger.error(f"Failed to copy {key}: {e}")
-                      return False
-
-              def _copy_small_file(self, key, source_meta):
-                  """Copy small file using memory"""
-                  source_obj = self.source_s3.get_object(Bucket=self.source_bucket, Key=key)
-                  body_content = source_obj['Body'].read()
+                  """Copy object from source to target with retry mechanism"""
+                  # Check prefix filter first
+                  if not self.should_sync_object(key):
+                      logger.info(f"Skipping {key} - does not match prefix filter: {self.prefix_filter}")
+                      return True
                   
-                  put_args = {'Bucket': self.target_bucket, 'Key': key, 'Body': body_content}
+                  for attempt in range(1, self.retry_attempts + 1):
+                      try:
+                          logger.info(f"Attempt {attempt}/{self.retry_attempts} for {key}")
+                          
+                          # Check if sync needed
+                          source_meta = self.get_object_metadata(self.source_s3, self.source_bucket, key)
+                          if not source_meta:
+                              logger.error(f"Source object {key} not found")
+                              return False
+                          
+                          target_meta = self.get_object_metadata(self.target_s3, self.target_bucket, key)
+                          if target_meta and (source_meta['etag'] == target_meta['etag'] and source_meta['size'] == target_meta['size']):
+                              logger.info(f"Object {key} already in sync")
+                              return True
+                          
+                          file_size_mb = source_meta['size'] / (1024 * 1024)
+                          logger.info(f"Copying {key}, size: {file_size_mb:.2f}MB from {self.source_region} to {self.target_region}")
+                          
+                          # Check if file size exceeds configured threshold
+                          if file_size_mb > self.file_size_threshold_mb:
+                              logger.warning(f"File {key} ({file_size_mb:.2f}MB) exceeds configured threshold ({self.file_size_threshold_mb}MB)")
+                              return False
+                          
+                          # Copy file based on processing mode and size
+                          success = self._copy_file(key, source_meta, file_size_mb)
+                          
+                          if success:
+                              logger.info(f"Successfully copied {key} on attempt {attempt}")
+                              return True
+                          else:
+                              logger.warning(f"Failed to copy {key} on attempt {attempt}")
+                              
+                      except Exception as e:
+                          logger.error(f"Attempt {attempt}/{self.retry_attempts} failed for {key}: {e}")
+                          if attempt == self.retry_attempts:
+                              logger.error(f"All {self.retry_attempts} attempts failed for {key}")
+                              self.send_failure_notification(key, str(e), attempt)
+                              return False
+                          else:
+                              wait_time = min(2 ** (attempt - 1), 30)  # Exponential backoff, max 30s
+                              logger.info(f"Waiting {wait_time}s before retry...")
+                              time.sleep(wait_time)
+                  
+                  return False
+
+              def _copy_file(self, key, source_meta, file_size_mb):
+                  """Copy file using appropriate method based on size and processing mode"""
+                  if self.processing_mode == 'memory' or file_size_mb <= 200:
+                      return self._copy_via_memory(key, source_meta)
+                  else:
+                      return self._copy_via_tmp(key, source_meta)
+
+              def _copy_via_memory(self, key, source_meta):
+                  """Copy file using memory"""
+                  source_obj = self.source_s3.get_object(Bucket=self.source_bucket, Key=key)
+                  put_args = {'Bucket': self.target_bucket, 'Key': key, 'Body': source_obj['Body'].read()}
                   if source_meta['content_type']:
                       put_args['ContentType'] = source_meta['content_type']
                   
                   self.target_s3.put_object(**put_args)
-                  logger.info(f"Successfully copied small file {key}")
+                  logger.info(f"Successfully copied file {key} via memory")
                   return True
 
-              def _copy_large_file(self, key, source_meta):
-                  """Copy large file using /tmp directory"""
-                  import os
-                  
+              def _copy_via_tmp(self, key, source_meta):
+                  """Copy file using /tmp directory"""
                   temp_file_path = f"/tmp/{os.path.basename(key)}"
                   
                   try:
                       # Download to /tmp
-                      logger.info(f"Downloading large file {key} to /tmp")
+                      logger.info(f"Downloading file {key} to /tmp")
                       self.source_s3.download_file(self.source_bucket, key, temp_file_path)
                       
                       # Upload from /tmp
-                      logger.info(f"Uploading large file {key} from /tmp")
+                      logger.info(f"Uploading file {key} from /tmp")
                       extra_args = {}
                       if source_meta['content_type']:
                           extra_args['ContentType'] = source_meta['content_type']
                       
                       self.target_s3.upload_file(temp_file_path, self.target_bucket, key, ExtraArgs=extra_args)
-                      
-                      logger.info(f"Successfully copied large file {key}")
+                      logger.info(f"Successfully copied file {key} via /tmp")
                       return True
                       
                   finally:
@@ -315,10 +463,7 @@ Resources:
                       try:
                           if record.get('eventSource') == 'aws:s3':
                               key = urllib.parse.unquote_plus(record['s3']['object']['key'])
-                              if self.copy_object(key):
-                                  results['success'].append(key)
-                              else:
-                                  results['failed'].append(key)
+                              (results['success'] if self.copy_object(key) else results['failed']).append(key)
                       except Exception as e:
                           logger.error(f"Error processing record: {e}")
                           results['failed'].append(str(record))
@@ -331,23 +476,18 @@ Resources:
                   
                   # Handle different event types
                   if 'Records' in event:
+                      # Direct S3 event format
                       results = sync.process_event(event['Records'])
                   elif 'detail' in event and 'object' in event['detail']:
-                      # EventBridge format
-                      record = {
-                          'eventSource': 'aws:s3',
-                          's3': {
-                              'object': {'key': event['detail']['object']['key']}
-                          }
-                      }
-                      results = sync.process_event([record])
+                      # EventBridge format from S3
+                      key = event['detail']['object']['key']
+                      success = sync.copy_object(key)
+                      results = {'success': [key] if success else [], 'failed': [] if success else [key]}
                   elif 'test_key' in event:
                       # Manual test
-                      success = sync.copy_object(event['test_key'])
-                      results = {
-                          'success': [event['test_key']] if success else [],
-                          'failed': [] if success else [event['test_key']]
-                      }
+                      key = event['test_key']
+                      success = sync.copy_object(key)
+                      results = {'success': [key] if success else [], 'failed': [] if success else [key]}
                   else:
                       raise ValueError("Unsupported event format")
                   
@@ -361,12 +501,9 @@ Resources:
                   
               except Exception as e:
                   logger.error(f"Lambda execution failed: {e}")
-                  return {
-                      'statusCode': 500,
-                      'body': {'error': str(e)}
-                  }
+                  return {'statusCode': 500, 'body': {'error': str(e)}}
 
-  # EventBridge rule
+  # EventBridge rule to capture S3 events
   S3EventRule:
     Type: AWS::Events::Rule
     Properties:
@@ -391,70 +528,6 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt S3EventRule.Arn
 
-  # S3 EventBridge configuration
-  S3NotificationConfiguration:
-    Type: AWS::CloudFormation::CustomResource
-    Properties:
-      ServiceToken: !GetAtt ConfigureS3NotificationFunction.Arn
-      SourceBucket: !Ref SourceBucketName
-
-  # S3 notification setup function
-  ConfigureS3NotificationFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      Runtime: python3.9
-      Handler: index.lambda_handler
-      Role: !GetAtt ConfigureS3NotificationRole.Arn
-      Timeout: 60
-      Code:
-        ZipFile: |
-          import boto3
-          import cfnresponse
-          import logging
-
-          def lambda_handler(event, context):
-              try:
-                  s3 = boto3.client('s3')
-                  bucket = event['ResourceProperties']['SourceBucket']
-                  
-                  if event['RequestType'] in ['Create', 'Update']:
-                      s3.put_bucket_notification_configuration(
-                          Bucket=bucket,
-                          NotificationConfiguration={'EventBridgeConfiguration': {}}
-                      )
-                  elif event['RequestType'] == 'Delete':
-                      s3.put_bucket_notification_configuration(
-                          Bucket=bucket,
-                          NotificationConfiguration={}
-                      )
-                  
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-              except Exception as e:
-                  logging.error(f"Error: {e}")
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
-
-  # Role for S3 notification setup
-  ConfigureS3NotificationRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub 'arn:aws-cn:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
-      Policies:
-        - PolicyName: S3NotificationPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: ['s3:PutBucketNotification', 's3:GetBucketNotification']
-                Resource: !Sub 'arn:aws-cn:s3:::${SourceBucketName}'
-
 Outputs:
   LambdaFunctionName:
     Description: 'Sync Lambda Function Name'
@@ -464,29 +537,71 @@ Outputs:
     Description: 'Secrets Manager Secret Name'
     Value: !Ref SecretsManagerSecretName
 
+  EventBridgeRuleName:
+    Description: 'EventBridge Rule Name'
+    Value: !Ref S3EventRule
+
   SetupInfo:
-    Description: 'Multi-Region Setup Information'
+    Description: 'Setup Information and Next Steps'
     Value: !Sub |
-      ✅ Cross-partition multi-region sync deployed successfully!
+      ✅ S3 Cross-partition sync deployed successfully!
       
-      📍 Source: ${SourceBucketName} (${SourceRegion}) → Target: ${TargetBucketName} (${TargetRegion})
+      📍 Configuration:
+      • Source: ${SourceBucketName} (${SourceRegion})
+      • Target: ${TargetBucketName} (${TargetRegion})
+      • Lambda: ${SyncLambdaFunction}
+      • EventBridge Rule: ${S3EventRule}
+      • Prefix Filter: ${S3PrefixFilter}
+      
       🔒 Credentials: Stored in Secrets Manager (${SecretsManagerSecretName})
-      💾 Lambda /tmp directory: ${TmpDirectorySize}MB
+      📊 File Size Category: ${MaxFileSizeCategory}
+      🔄 Retry Attempts: ${RetryAttempts}
+      📧 SNS Notifications: ${EnableSNSNotification}
       
-      📊 Supported regions:
-      • Source: cn-northwest-1, cn-north-1 (AWS China)
-      • Target: All major AWS Global regions
+      ⚠️  IMPORTANT - Manual Setup Required:
+      1. Enable EventBridge notifications on source S3 bucket:
+         aws s3api put-bucket-notification-configuration \
+           --bucket ${SourceBucketName} \
+           --notification-configuration '{"EventBridgeConfiguration": {}}'
       
-      📋 File processing capabilities:
-      • Small files (< 100MB): Memory processing
-      • Large files (≥ 100MB): /tmp directory processing
+      2. Create target bucket in target account:
+         aws s3 mb s3://${TargetBucketName} --region ${TargetRegion}
       
-      Next steps for target account:
-      1. Create bucket: aws s3 mb s3://${TargetBucketName} --region ${TargetRegion}
-      2. Ensure target Access Key has S3 permissions for ${TargetBucketName}
-      3. Test: Upload file to ${SourceBucketName}
+      3. Ensure target Access Key has S3 permissions for ${TargetBucketName}
 
   TestCommand:
-    Description: 'Test sync function'
+    Description: 'Test sync function manually'
     Value: !Sub |
-      aws lambda invoke --function-name ${SyncLambdaFunction} --payload '{"test_key":"test/sample.txt"}' response.json 
+      aws lambda invoke --function-name ${SyncLambdaFunction} --payload '{"test_key":"test/sample.txt"}' response.json
+
+  S3EventBridgeSetupCommand:
+    Description: 'Command to enable S3 EventBridge notifications'
+    Value: !Sub |
+      aws s3api put-bucket-notification-configuration --bucket ${SourceBucketName} --notification-configuration '{"EventBridgeConfiguration": {}}'
+
+  LambdaConfiguration:
+    Description: 'Lambda Configuration Details'
+    Value: !Sub 
+      - |
+        📊 File Size Category: ${MaxFileSizeCategory}
+        💾 Lambda Memory: ${MemorySize}MB  
+        💽 Lambda /tmp Directory: ${TmpSize}MB
+        📏 Max File Size Threshold: ${ThresholdMB}MB
+        ⏱️ Timeout: ${TimeoutSeconds}s
+      - MemorySize: !FindInMap [FileSizeConfig, !Ref MaxFileSizeCategory, MemorySize]
+        TmpSize: !FindInMap [FileSizeConfig, !Ref MaxFileSizeCategory, TmpDirectorySize]
+        ThresholdMB: !FindInMap [FileSizeConfig, !Ref MaxFileSizeCategory, ThresholdMB]
+        TimeoutSeconds: !FindInMap [FileSizeConfig, !Ref MaxFileSizeCategory, TimeoutSeconds]
+
+  SNSTopicArn:
+    Description: 'SNS Topic ARN for failure notifications'
+    Condition: CreateSNSNotification
+    Value: !Ref FailureNotificationTopic
+
+  SNSSetupInfo:
+    Description: 'SNS Notification Setup Information'
+    Condition: CreateSNSNotification
+    Value: !Sub |
+      📧 SNS Topic: ${FailureNotificationTopic}
+      📬 Email: ${NotificationEmail}
+      ⚠️  Please check your email and confirm the SNS subscription! 
